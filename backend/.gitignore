@@ -1,0 +1,60 @@
+# ─── KrishiMitra Backend .gitignore ───────────────────────────────────────────
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment Variables (NEVER commit secrets)
+.env
+.env.local
+.env.production
+
+# ML Models (large binary files – store in model registry instead)
+app/ai/ml/saved_models/*.joblib
+app/ai/ml/saved_models/*.pkl
+models/
+
+# Audio outputs (runtime generated)
+audio_outputs/
+
+# Logs
+logs/
+*.log
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.env.docker
+
+# Temporary files
+/tmp/km_audio_*
