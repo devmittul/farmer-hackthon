@@ -4,7 +4,7 @@ import { useAppStore } from '@/store/useAppStore';
 import {
   Sprout, LayoutDashboard, Leaf, Droplet,
   Stethoscope, FileText, Settings, LogOut, Menu, UserCircle, Bell, Search,
-  Map, Globe, Activity, Clock
+  Map, Globe, Activity, Clock, RefreshCw
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet';
@@ -104,7 +104,10 @@ export function DashboardLayout() {
     setWeatherCache,
     farms,
     activateFarm,
-    logout
+    logout,
+    refreshFarmData,
+    refreshing,
+    lastRefreshedAt,
   } = useAppStore();
   const location = useLocation();
   const navigate = useNavigate();
@@ -365,6 +368,20 @@ export function DashboardLayout() {
               <Bell className="h-5 w-5" strokeWidth={1.5} />
               <Badge className="absolute top-2 right-2 h-2.5 w-2.5 p-0 flex justify-center items-center rounded-full bg-orange-400 text-[0px] border-2 border-white">3</Badge>
               <span className="sr-only">Toggle notifications</span>
+            </button>
+            <button
+              onClick={() => refreshFarmData()}
+              disabled={refreshing}
+              title={lastRefreshedAt ? `Last refreshed: ${new Date(lastRefreshedAt).toLocaleTimeString()}` : 'Refresh all farm data'}
+              className="relative p-2.5 text-muted-foreground hover:text-green-600 transition-colors rounded-full hover:bg-green-50 shadow-[0_2px_10px_rgba(0,0,0,0.02)] hidden sm:flex items-center gap-2 disabled:opacity-50"
+            >
+              <RefreshCw className={`h-5 w-5 ${refreshing ? 'animate-spin' : ''}`} strokeWidth={1.5} />
+              {lastRefreshedAt && (
+                <span className="text-[10px] font-light text-muted-foreground hidden lg:inline">
+                  {new Date(lastRefreshedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                </span>
+              )}
+              <span className="sr-only">Refresh Farm Data</span>
             </button>
             <Link to="/dashboard/profile" className="flex items-center gap-4 pl-4 lg:pl-6 sm:border-l border-border/50 group">
               <div className="flex flex-col items-end hidden md:flex">

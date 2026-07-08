@@ -1,20 +1,15 @@
 import asyncio
-import sys
-import os
-
-sys.path.append(os.path.abspath('backend'))
-from app.config import Settings
-from app.ai.reasoning_engine import ReasoningEngine
 import logging
+from app.ai.reasoning_engine import ReasoningEngine
 
 logging.basicConfig(level=logging.INFO)
 
-async def test_claude():
+async def test():
     try:
-        reply, latency = await ReasoningEngine.generate("Hello, are you working?", max_retries=1)
-        print("Success:", reply, "Latency:", latency)
+        reply, latency = await ReasoningEngine.generate("Hello, how are you?")
+        print("Reply:", reply)
+        print("Latency:", latency)
     except Exception as e:
-        print("Error:", e)
+        print("Error:", repr(e))
 
-if __name__ == "__main__":
-    asyncio.run(test_claude())
+asyncio.run(test())

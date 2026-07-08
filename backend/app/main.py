@@ -206,7 +206,10 @@ def _register_routes(app: FastAPI) -> None:
     from app.routes.system import router as system_router
     app.include_router(system_router, prefix=api_prefix)
 
-    logger.info("Registered %d routers under %s", 12, api_prefix)
+    from app.routes.refresh import router as refresh_router
+    app.include_router(refresh_router, prefix=api_prefix)
+
+    logger.info("Registered %d routers under %s", 13, api_prefix)
 
 
 def _register_exception_handlers(app: FastAPI) -> None:

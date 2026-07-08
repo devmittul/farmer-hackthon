@@ -409,75 +409,100 @@ class TestResponseFormatter:
 class TestDigitalTwinPrompts:
     """Tests for the new Digital Twin-aware prompt builder functions."""
 
+    class MockContext:
+        def __init__(self, **kwargs):
+            self.provider_data = kwargs.get("provider_data", {})
+            self.provider_metadata = kwargs.get("provider_metadata", {})
+
     def test_field_intelligence_prompt_contains_ndvi(self):
-        from app.ai.prompt_builder import build_field_intelligence_prompt
+        from app.ai.prompt_builder import build_digital_twin_prompt_from_context
         from app.schemas.requests import LanguageCode
-        prompt = build_field_intelligence_prompt(
+        
+        ctx = self.MockContext(
+            provider_data={
+                "digital_twin": {
+                    "farmer": {"name": "Ramesh", "district": "Ahmedabad", "state": "Gujarat",
+                            "preferred_language": "en", "primary_crops": ["wheat"]},
+                    "field": {"name": "North Field", "area_ha": 2.5, "soil_type": "loamy",
+                           "soil_ph": 6.5, "current_crop": "wheat",
+                           "nitrogen_kg_ha": 60, "phosphorus_kg_ha": 40, "potassium_kg_ha": 40,
+                           "irrigation_type": "drip", "water_source": "borewell",
+                           "sowing_date": "2026-03-01", "expected_harvest_date": "2026-06-01",
+                           "current_variety": "HD2967", "growth_stage": "flowering"}
+                },
+                "weather": {"current": {"temperature_c": 28, "condition": "Partly Cloudy",
+                                     "humidity_pct": 65},
+                         "forecast": [{"date": "2026-07-02", "condition": "Sunny",
+                                       "temp_min_c": 22, "temp_max_c": 34,
+                                       "rainfall_mm": 0}]},
+                "satellite": {"ndvi": 0.62, "crop_health": "Good crop health",
+                           "vegetation_index": 62.0,
+                           "harvest_detection": "Grain fill / maturation stage",
+                           "analysis_date": "2026-07-01"},
+                "ml_inference": {
+                    "yield_prediction": {"yield_kg_per_ha": 3200, "total_yield_kg": 8000,
+                                   "confidence": 88, "category": "good"},
+                    "disease_risk": {"risk_level": "MODERATE", "risk_score": 35.0,
+                                  "confidence": 72.0, "common_diseases": ["Rust"],
+                                  "preventive_actions": ["Scout field every 3 days",
+                                                          "Apply preventive fungicide"]}
+                }
+            },
+            provider_metadata={
+                "digital_twin": {"source": "MongoDB", "freshness": "semi_static"},
+                "satellite": {"source": "Sentinel-2 SR (GEE)", "freshness": "dynamic"}
+            }
+        )
+        
+        prompt = build_digital_twin_prompt_from_context(
             user_message="How is my crop doing?",
             language=LanguageCode.EN,
-            farmer={"name": "Ramesh", "district": "Ahmedabad", "state": "Gujarat",
-                    "preferred_language": "en", "primary_crops": ["wheat"]},
-            field={"name": "North Field", "area_ha": 2.5, "soil_type": "loamy",
-                   "soil_ph": 6.5, "current_crop": "wheat",
-                   "nitrogen_kg_ha": 60, "phosphorus_kg_ha": 40, "potassium_kg_ha": 40,
-                   "irrigation_type": "drip", "water_source": "borewell",
-                   "sowing_date": "2026-03-01", "expected_harvest_date": "2026-06-01",
-                   "current_variety": "HD2967", "growth_stage": "flowering"},
-            weather={"current": {"temperature_c": 28, "condition": "Partly Cloudy",
-                                 "humidity_pct": 65},
-                     "forecast": [{"date": "2026-07-02", "condition": "Sunny",
-                                   "temp_min_c": 22, "temp_max_c": 34,
-                                   "rainfall_mm": 0}]},
-            satellite={"ndvi": 0.62, "crop_health": "Good crop health",
-                       "vegetation_index": 62.0,
-                       "harvest_detection": "Grain fill / maturation stage",
-                       "analysis_date": "2026-07-01"},
-            yield_prediction={"yield_kg_per_ha": 3200, "total_yield_kg": 8000,
-                               "confidence": 88, "category": "good"},
-            disease_risk={"risk_level": "MODERATE", "risk_score": 35.0,
-                          "confidence": 72.0, "common_diseases": ["Rust"],
-                          "preventive_actions": ["Scout field every 3 days",
-                                                  "Apply preventive fungicide"]},
+            ctx=ctx
         )
         # Verify key facts are injected
         assert "Ramesh" in prompt
         assert "North Field" in prompt
         assert "0.62" in prompt
-        assert "NDVI" in prompt
+        assert "Ndvi" in prompt  # The generic formatter capitalizes keys
         assert "3200" in prompt  # yield
         assert "MODERATE" in prompt   # disease risk
         assert "wheat" in prompt.lower()
         assert "English" in prompt
 
     def test_field_intelligence_prompt_with_water_stress(self):
-        from app.ai.prompt_builder import build_field_intelligence_prompt
+        from app.ai.prompt_builder import build_digital_twin_prompt_from_context
         from app.schemas.requests import LanguageCode
-        prompt = build_field_intelligence_prompt(
+        
+        ctx = self.MockContext(
+            provider_data={
+                "ml_inference": {
+                    "water_stress": {"stress_level": "severe", "irrigate_now": True,
+                                  "water_need_mm": 45, "recommendation": "Irrigate immediately",
+                                  "et_estimate_mm": 38.5, "rainfall_effective_mm": 0}
+                }
+            }
+        )
+        
+        prompt = build_digital_twin_prompt_from_context(
             user_message="Should I irrigate today?",
             language=LanguageCode.HI,
-            farmer=None,
-            field=None,
-            weather=None,
-            satellite=None,
-            water_stress={"stress_level": "severe", "irrigate_now": True,
-                          "water_need_mm": 45, "recommendation": "Irrigate immediately",
-                          "et_estimate_mm": 38.5, "rainfall_effective_mm": 0},
+            ctx=ctx
         )
-        assert "SEVERE" in prompt
+        assert "severe" in prompt.lower()
         assert "45" in prompt
         assert "Hindi" in prompt
 
     def test_field_intelligence_prompt_without_field_data_still_works(self):
-        from app.ai.prompt_builder import build_field_intelligence_prompt
+        from app.ai.prompt_builder import build_digital_twin_prompt_from_context
         from app.schemas.requests import LanguageCode
-        # Should not raise even if all optional data is None
-        prompt = build_field_intelligence_prompt(
+        
+        ctx = self.MockContext(provider_data={})
+        
+        # Should not raise even if all optional data is missing
+        prompt = build_digital_twin_prompt_from_context(
             user_message="What crop should I grow?",
             language=LanguageCode.EN,
-            farmer=None,
-            field=None,
-            weather=None,
-            satellite=None,
+            ctx=ctx
         )
         assert len(prompt) > 50
         assert "KrishiMitra" in prompt

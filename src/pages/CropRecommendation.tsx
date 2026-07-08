@@ -78,6 +78,12 @@ export default function CropRecommendation() {
     if (farmId) {
       try {
         await activateFarm(farmId);
+        const farm = farms.find(f => f.farm_id === farmId);
+        if (farm) {
+          const locName = farm.village || farm.district || farm.name || activeLocation;
+          setField('location', locName);
+          setActiveLocation(locName);
+        }
       } catch (err) {
         console.error("Failed to activate farm:", err);
       }
@@ -94,7 +100,7 @@ export default function CropRecommendation() {
           nitrogen: field.nitrogen_kg_ha !== undefined && field.nitrogen_kg_ha !== null ? field.nitrogen_kg_ha : f.nitrogen,
           phosphorus: field.phosphorus_kg_ha !== undefined && field.phosphorus_kg_ha !== null ? field.phosphorus_kg_ha : f.phosphorus,
           potassium: field.potassium_kg_ha !== undefined && field.potassium_kg_ha !== null ? field.potassium_kg_ha : f.potassium,
-          ph: field.soil_ph !== undefined && field.soil_ph !== null ? field.soil_ph : f.ph,
+          ph: field.soil_profile?.ph_h2o ?? field.soil_ph ?? f.ph,
         }));
       }
     }
@@ -106,7 +112,10 @@ export default function CropRecommendation() {
     const WEATHER_TTL_MS = 15 * 60 * 1000;
     const cacheAge = weatherCachedAt ? Date.now() - weatherCachedAt : Infinity;
 
-    if (weatherCache && cacheAge < WEATHER_TTL_MS) {
+    // Only use cache if the location is loosely matching (to avoid using old cache for new farm)
+    const isSameLocation = weatherCache?.location?.toLowerCase().includes(activeLocation.split(',')[0].toLowerCase().trim());
+    
+    if (weatherCache && cacheAge < WEATHER_TTL_MS && isSameLocation) {
       applyWeatherToForm(weatherCache);
     } else {
       setWeatherFilling(true);
@@ -117,6 +126,17 @@ export default function CropRecommendation() {
         })
         .catch(() => { /* keep defaults */ })
         .finally(() => setWeatherFilling(false));
+    }
+
+    // Auto-fetch soil pH based on location if not using a specific field
+    if (!selectedFieldId && activeLocation) {
+      cropApi.getSoil(activeLocation)
+        .then((data: any) => {
+          if (data && data.ph_h2o) {
+            setForm(f => ({ ...f, ph: parseFloat(data.ph_h2o.toFixed(1)) }));
+          }
+        })
+        .catch(() => { /* ignore */ });
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeLocation, weatherCachedAt]);
@@ -367,7 +387,7 @@ export default function CropRecommendation() {
                           { key: 'temperature', label: 'Temp (°C)', min: 0, max: 50, step: '0.1', icon: Thermometer, color: 'text-orange-500' },
                           { key: 'humidity', label: 'Humidity (%)', min: 0, max: 100, step: '1', icon: Droplets, color: 'text-blue-500' },
                           { key: 'ph', label: 'Soil pH', min: 0, max: 14, step: '0.1', icon: Wind, color: 'text-purple-500' },
-                          { key: 'rainfall', label: 'Rainfall (mm)', min: 0, max: 3000, step: '1', icon: CloudRain, color: 'text-cyan-500' },
+                          { key: 'rainfall', label: 'Rainfall (mm)', min: 0, max: 3000, step: '0.1', icon: CloudRain, color: 'text-cyan-500' },
                         ].map(({ key, label, min, max, step, icon: Icon, color }) => (
                           <div key={key} className="space-y-3">
                             <Label className="text-xs font-semibold uppercase tracking-widest text-muted-foreground flex items-center gap-2">

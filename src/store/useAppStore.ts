@@ -4,7 +4,7 @@
  */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { authApi, farmApi, tokenStore, type UserProfile, type WeatherData } from '@/services/api';
+import { authApi, farmApi, refreshApi, tokenStore, type UserProfile, type WeatherData, type RefreshResult } from '@/services/api';
 import type { Farm } from '@/types/farm';
 
 interface AppState {
@@ -33,6 +33,16 @@ interface AppState {
   /** Whether farms are currently being loaded. */
   farmsLoading: boolean;
 
+  // ── Refresh State (Provider Architecture v2) ──────────────────────────────
+  /** Whether a full refresh is in progress. */
+  refreshing: boolean;
+  /** Result of the last full refresh. */
+  lastRefresh: RefreshResult | null;
+  /** Epoch ms of last completed refresh. */
+  lastRefreshedAt: number | null;
+  /** Error message from last failed refresh. */
+  refreshError: string | null;
+
   // Actions
   login: (email: string, password: string) => Promise<void>;
   register: (data: {
@@ -56,6 +66,9 @@ interface AppState {
   setActiveFarm: (farm: Farm | null) => Promise<void>;
   setFarms: (farms: Farm[]) => void;
   activateFarm: (farmId: string) => Promise<void>;
+
+  // Refresh actions
+  refreshFarmData: (farmId?: string, fieldId?: string) => Promise<void>;
 }
 
 const getFarmLocationString = async (farm: Farm): Promise<string> => {
@@ -95,6 +108,10 @@ export const useAppStore = create<AppState>()(
       farms: [],
       activeFarm: null,
       farmsLoading: false,
+      refreshing: false,
+      lastRefresh: null,
+      lastRefreshedAt: null,
+      refreshError: null,
 
       login: async (email, password) => {
         set({ authLoading: true, authError: null });
@@ -227,6 +244,28 @@ export const useAppStore = create<AppState>()(
       setUser: (user) => set({ user, isAuthenticated: !!user }),
       setActiveLocation: (location) => set({ activeLocation: location }),
       setWeatherCache: (weather) => set({ weatherCache: weather, weatherCachedAt: Date.now() }),
+
+      refreshFarmData: async (farmId, fieldId) => {
+        if (!tokenStore.get()) return;
+        set({ refreshing: true, refreshError: null });
+        try {
+          const fId = farmId || get().activeFarm?.farm_id;
+          const result = await refreshApi.fullRefresh(fId, fieldId);
+          set({
+            refreshing: false,
+            lastRefresh: result,
+            lastRefreshedAt: Date.now(),
+            refreshError: null,
+            // Invalidate weather cache so dashboard re-fetches
+            weatherCache: null,
+            weatherCachedAt: null,
+          });
+          // Reload farms to pick up any updated satellite data
+          get().loadFarms();
+        } catch (err: any) {
+          set({ refreshing: false, refreshError: err.message });
+        }
+      },
     }),
     {
       name: 'krishimitra-store',
@@ -238,6 +277,7 @@ export const useAppStore = create<AppState>()(
         weatherCache: state.weatherCache,
         weatherCachedAt: state.weatherCachedAt,
         activeFarm: state.activeFarm,
+        lastRefreshedAt: state.lastRefreshedAt,
       }),
     },
   ),

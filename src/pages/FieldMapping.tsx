@@ -41,7 +41,7 @@ export default function FieldMapping() {
   const [selectedFarm, setSelectedFarm] = useState<Farm | null>(null);
 
   // Mapbox Token configuration
-  const mapboxToken = import.meta.env.VITE_MAPBOX_ACCESS_TOKEN as string | undefined;
+  const mapboxToken = import.meta.env.VITE_MAPBOX_TOKEN || '';
 
   // Map Views & Controls
   const [mapStyle, setMapStyle] = useState<'satellite' | 'streets'>('satellite');

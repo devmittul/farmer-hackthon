@@ -69,22 +69,35 @@ def _get_claude_client():
     return _claude_client
 
 
-def _get_gemini_model():
-    """Lazy-initialise the Google Generative AI model."""
-    global _gemini_model
-    if _gemini_model is not None:
-        return _gemini_model
+_gemini_key_index = 0
+
+def _get_gemini_model(force_next_key=False):
+    """Lazy-initialise the Google Generative AI model with key rotation support."""
+    global _gemini_key_index
     try:
         import google.generativeai as genai
+        from app.config import get_settings
         settings = get_settings()
-        genai.configure(api_key=getattr(settings, "gemini_api_key", ""))
-        _gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-        logger.info("ReasoningEngine: Gemini model initialised")
+        keys = settings.gemini_keys_list
+        if not keys:
+            raise ValueError("No Gemini keys found in configuration.")
+            
+        if force_next_key:
+            _gemini_key_index = (_gemini_key_index + 1) % len(keys)
+            logger.info("ReasoningEngine: Switched to Gemini API key index %d", _gemini_key_index)
+            
+        current_key = keys[_gemini_key_index]
+        genai.configure(api_key=current_key)
+        
+        # Instantiate model so it picks up the active config
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        if _gemini_key_index == 0 and not force_next_key:
+             logger.info("ReasoningEngine: Gemini model initialised")
+        return model
     except ImportError:
         raise RuntimeError(
             "google-generativeai package not installed."
         )
-    return _gemini_model
 
 
 # ── Main interface ─────────────────────────────────────────────────────────────
@@ -191,10 +204,18 @@ class ReasoningEngine:
         max_tokens: int,
         max_retries: int,
     ) -> tuple[str, float]:
-        model = _get_gemini_model()
         last_error: Optional[Exception] = None
+        from app.config import get_settings
+        keys = get_settings().gemini_keys_list
+        
+        # Allow enough attempts to cycle through all keys at least twice if needed
+        total_attempts = max(max_retries + 1, len(keys) * 2)
 
-        for attempt in range(max_retries + 1):
+        force_next = False
+        for attempt in range(total_attempts):
+            model = _get_gemini_model(force_next_key=force_next)
+            force_next = False
+            
             try:
                 start = time.perf_counter()
                 # google-generativeai is sync; wrap in thread
@@ -204,13 +225,22 @@ class ReasoningEngine:
                 )
                 elapsed_ms = (time.perf_counter() - start) * 1000
                 text = response.text.strip()
-                logger.info("ReasoningEngine [Gemini]: %.1fms", elapsed_ms)
+                logger.info("ReasoningEngine [Gemini]: %.1fms attempt=%d", elapsed_ms, attempt + 1)
                 return text, round(elapsed_ms, 2)
 
             except Exception as exc:
                 last_error = exc
+                err_str = str(exc).lower()
                 logger.warning("Gemini attempt %d failed: %s", attempt + 1, exc)
-                await asyncio.sleep(1.5 * (attempt + 1))
+                
+                # Check for rate limit (429), quota exceeded (403), unauthorized (401), or exhausted
+                if any(k in err_str for k in ("429", "quota", "403", "401", "exhausted", "invalid")):
+                    if len(keys) > 1:
+                        logger.info("Gemini quota/auth error, switching to next key...")
+                        force_next = True
+                    await asyncio.sleep(0.5)
+                else:
+                    await asyncio.sleep(1.5 * (attempt + 1))
 
         raise RuntimeError(f"Gemini reasoning failed. Last error: {last_error}")
 

@@ -41,7 +41,7 @@ export default function Irrigation() {
     }
   };
 
-  useEffect(() => { fetchData(location); }, []);
+  useEffect(() => { fetchData(location, true); }, []);
 
   const syncLocation = () => {
     if (!navigator.geolocation) return;
@@ -113,7 +113,7 @@ export default function Irrigation() {
             </Button>
             <Button 
               className="h-14 px-8 bg-foreground hover:bg-foreground/90 text-background rounded-full font-medium text-base shadow-[0_8px_30px_rgba(0,0,0,0.12)] active:scale-[0.98] transition-transform"
-              onClick={() => { setLocation(inputLocation); fetchData(inputLocation); }}
+              onClick={() => { setLocation(inputLocation); fetchData(inputLocation, true); }}
             >
               Update
             </Button>

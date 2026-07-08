@@ -145,25 +145,36 @@ export const authApi = {
 
 // ── Chat API ──────────────────────────────────────────────────────────────────
 export const chatApi = {
-  send: (
+  send: async (
     message: string,
     location?: string,
     sessionId?: string,
     language = 'en',
     fieldId?: string,
     farmId?: string,
-  ) =>
-    apiFetch<ChatMessage>('/chat', {
-      method: 'POST',
-      body: JSON.stringify({
-        message,
-        location,
-        session_id: sessionId,
-        language,
-        field_id: fieldId,
-        farm_id: farmId,
-      }),
-    }),
+  ) => {
+    const startTime = performance.now();
+    try {
+      const response = await apiFetch<ChatMessage>('/chat', {
+        method: 'POST',
+        body: JSON.stringify({
+          message,
+          location,
+          session_id: sessionId,
+          language,
+          field_id: fieldId,
+          farm_id: farmId,
+        }),
+      });
+      const latencyMs = performance.now() - startTime;
+      console.log(`Frontend Request (/chat) completed in ${latencyMs.toFixed(2)}ms`);
+      return response;
+    } catch (error) {
+      const latencyMs = performance.now() - startTime;
+      console.error(`Frontend Request (/chat) failed after ${latencyMs.toFixed(2)}ms`, error);
+      throw error;
+    }
+  },
 
   history: (limit = 20, skip = 0) =>
     apiFetch<ChatMessage[]>(`/history?limit=${limit}&skip=${skip}`),
@@ -229,10 +240,16 @@ export const cropApi = {
     language?: string; location?: string;
     user_question?: string; crop_concern?: string;
   }) => {
-    return await apiFetch<CropResult>('/crop/predict', {
-      method: 'POST', body: JSON.stringify(inputs),
+    return apiFetch<CropResult>('/crop/predict', {
+      method: 'POST',
+      body: JSON.stringify(inputs),
     });
   },
+  getSoil: async (location: string) => {
+    return apiFetch<any>(`/crop/soil?location=${encodeURIComponent(location)}`, {
+      method: 'GET'
+    });
+  }
 };
 
 // ── Route API ─────────────────────────────────────────────────────────────────
@@ -310,6 +327,33 @@ export const twinApi = {
 // ── System API ────────────────────────────────────────────────────────────────
 export const systemApi = {
   getStatus: () => apiFetch<Record<string, { status: string; message: string }>>('/system/status'),
+};
+
+// ── Refresh API (Provider Architecture v2) ────────────────────────────────────
+export interface RefreshResult {
+  refresh_id: string;
+  status: string;
+  elapsed_ms: number;
+  steps: Array<{ message: string; at: string }>;
+  providers_refreshed: Array<{ name: string; available: boolean; status: string }>;
+  snapshot_version: number;
+}
+
+export const refreshApi = {
+  /** Full refresh: re-run every provider, ignore all caches */
+  fullRefresh: (farmId?: string, fieldId?: string) =>
+    apiFetch<RefreshResult>('/refresh/full', {
+      method: 'POST',
+      body: JSON.stringify({ farm_id: farmId, field_id: fieldId }),
+    }),
+
+  /** Get refresh progress */
+  getStatus: (refreshId: string) =>
+    apiFetch<any>(`/refresh/status/${refreshId}`),
+
+  /** Get the latest refresh snapshot */
+  getLatest: () =>
+    apiFetch<any>('/refresh/latest'),
 };
 
 // ── Fields API (New Module) ───────────────────────────────────────────────────

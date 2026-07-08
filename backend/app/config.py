@@ -58,6 +58,10 @@ class Settings(BaseSettings):
 
     # ── Gemini AI (optional future provider) ──────────────────────────────────
     gemini_api_key: str = Field(default="")
+    
+    @property
+    def gemini_keys_list(self) -> List[str]:
+        return [k.strip() for k in self.gemini_api_key.split(",") if k.strip()]
 
     # ── OpenAI-compatible (local Llama, Qwen, DeepSeek, etc.) ────────────────
     openai_api_key: str = Field(default="")
@@ -72,6 +76,7 @@ class Settings(BaseSettings):
     # ── Google Earth Engine ───────────────────────────────────────────────────
     gee_service_account: str = Field(default="")
     gee_key_file: str = Field(default="")
+    
 
     # ── Rate Limiting ─────────────────────────────────────────────────────────
     rate_limit_requests: int = Field(default=60)

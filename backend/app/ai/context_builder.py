@@ -20,6 +20,14 @@ Hard rules:
   • CPU-bound ML inference is wrapped in asyncio.to_thread() so the
     FastAPI event loop is never blocked.
 
+Architecture (v2 – Provider Pattern):
+  Data fetching is now delegated to independent Providers registered in
+  ``app.ai.providers.registry``.  The ContextBuilder's sole responsibility
+  is to orchestrate providers and assemble StructuredContext.
+
+  The refactored build() preserves identical external behaviour:
+  same StructuredContext schema, same field names, same data quality.
+
 Usage:
     ctx = await ContextBuilder.build(
         intent=intent,
@@ -71,7 +79,6 @@ class StructuredContext:
     weather: Optional[Dict[str, Any]] = None
     weather_advisory: Optional[str] = None
     satellite: Optional[Dict[str, Any]] = None
-
     # ── ML predictions ────────────────────────────────────────────────────────
     crop_prediction: Optional[Dict[str, Any]] = None
     vehicle_prediction: Optional[Dict[str, Any]] = None
@@ -88,6 +95,38 @@ class StructuredContext:
     extra: Dict[str, Any] = dc_field(default_factory=dict)
     """Route params, courier params, SOS coords – anything intent-specific."""
 
+    # ── Provider metadata (v2) ────────────────────────────────────────────────
+    provider_metadata: Dict[str, Dict[str, Any]] = dc_field(default_factory=dict)
+    """Maps provider name → ProviderMetadata dict for refresh tracking."""
+    
+    provider_data: Dict[str, Any] = dc_field(default_factory=dict)
+    """Maps provider name → Raw/Normalized Provider Result Data."""
+
+
+# ── Register all providers ────────────────────────────────────────────────────
+
+def _ensure_providers_registered() -> None:
+    """Register all providers once at module level."""
+    from app.ai.providers import registry
+
+    if registry.names():
+        return  # already registered
+
+    from app.ai.providers.chat_history_provider import ChatHistoryProvider
+    from app.ai.providers.digital_twin_provider import DigitalTwinProvider
+    from app.ai.providers.market_provider import MarketProvider
+    from app.ai.providers.ml_provider import MLProvider
+    from app.ai.providers.satellite_provider import SatelliteProvider
+    from app.ai.providers.weather_provider import WeatherProvider
+    from app.ai.providers.geesoil_provider import GEESoilProvider
+    
+    registry.register(DigitalTwinProvider())
+    registry.register(WeatherProvider())
+    registry.register(SatelliteProvider())
+    registry.register(MarketProvider())
+    registry.register(ChatHistoryProvider())
+    registry.register(MLProvider())
+    registry.register(GEESoilProvider())
 
 # ── Context Builder ───────────────────────────────────────────────────────────
 
@@ -95,8 +134,8 @@ class ContextBuilder:
     """
     Assembles a StructuredContext for every inbound request.
 
-    All gathering is concurrent where possible (asyncio.gather).
-    Each source is independently try/except guarded.
+    v2: Delegates data fetching to registered Providers.
+    Preserves identical StructuredContext output.
     """
 
     @classmethod
@@ -135,6 +174,8 @@ class ContextBuilder:
             request_id, intent, language, user_id or "anon",
         )
 
+        _ensure_providers_registered()
+
         ctx = StructuredContext(
             request_id=request_id,
             timestamp=datetime.now(UTC).isoformat(),
@@ -145,18 +186,23 @@ class ContextBuilder:
             extra=extra_params or {},
         )
 
-        # ── Run concurrent I/O fetches ────────────────────────────────────────
-        tasks = [
-            cls._load_digital_twin(ctx, user_id, field_id, farm_id),
-            cls._fetch_weather(ctx),
-            cls._fetch_satellite(ctx),
-            cls._fetch_market_prices(ctx),
-            cls._load_chat_history(ctx, user_id),
-        ]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        params: Dict[str, Any] = {
+            "user_id": user_id,
+            "field_id": field_id,
+            "farm_id": farm_id,
+            "location": location,
+            "intent": intent.value,
+            "extra_params": extra_params or {},
+        }
 
-        # ── Run ML predictions synchronously in thread pool ───────────────────
-        await cls._run_ml(ctx, intent, extra_params or {})
+        # ── Phase 1: Load Digital Twin (needed for derived location) ──────────
+        await cls._run_digital_twin(ctx, params)
+
+        # ── Phase 2: Concurrent data fetching (Weather, Satellite, Market, Chat)
+        await cls._run_concurrent_providers(ctx, params)
+
+        # ── Phase 3: ML Inference (depends on Phase 1 + 2 outputs) ────────────
+        await cls._run_ml_provider(ctx, params)
 
         logger.info(
             "Context ready: sources=%s",
@@ -164,375 +210,207 @@ class ContextBuilder:
         )
         return ctx
 
-    # ── Private helpers ───────────────────────────────────────────────────────
+    # ── Phase 1: Digital Twin ─────────────────────────────────────────────────
 
     @staticmethod
-    async def _load_digital_twin(
+    async def _run_digital_twin(
         ctx: StructuredContext,
-        user_id: Optional[str],
-        field_id: Optional[str],
-        farm_id: Optional[str] = None,
-    ) -> None:
-        """Load FarmerProfile, FarmProfile (geo-aware), and FieldProfile from MongoDB."""
-        if not user_id:
-            ctx.data_sources["digital_twin"] = False
-            return
-
-        try:
-            from app.database import get_collection
-            from app.repositories import FarmRepository
-
-            # Farmer profile
-            farmer_col = get_collection("farmer_profiles")
-            farmer_doc = await farmer_col.find_one({"user_id": user_id})
-            if farmer_doc:
-                farmer_doc.pop("_id", None)
-                ctx.farmer = farmer_doc
-                ctx.data_sources["farmer_profile"] = True
-            else:
-                ctx.data_sources["farmer_profile"] = False
-
-            # ── Load farm (geo-aware, new system) ────────────────────────────
-            # Priority: explicit farm_id → active farm → most recent farm
-            farm_doc = None
-            if farm_id:
-                farm_doc = await FarmRepository.get(farm_id, user_id)
-            if not farm_doc:
-                farm_doc = await FarmRepository.get_any(user_id)
-
-            if farm_doc:
-                farm_doc.pop("_id", None)
-                ctx.farm = farm_doc
-                ctx.data_sources["farm_profile"] = True
-
-                # Derive location from farm center coordinate if no explicit location
-                center = farm_doc.get("center_coordinate") or {}
-                if center.get("latitude") and not ctx.location:
-                    ctx.location = f"{center['latitude']},{center['longitude']}"
-                    logger.debug(
-                        "ContextBuilder: derived location from farm center: %s", ctx.location
-                    )
-            else:
-                ctx.data_sources["farm_profile"] = False
-
-            # Validation fallback: if location is still not set and we have farmer profile
-            if not ctx.location and farmer_doc and farmer_doc.get("location"):
-                ctx.location = farmer_doc.get("location")
-                logger.debug(
-                    "ContextBuilder: derived location from farmer registered home location: %s", ctx.location
-                )
-
-            # ── Load specific field if requested ──────────────────────────────
-            if field_id:
-                fields_col = get_collection("fields")
-                from bson import ObjectId
-                field_doc = None
-                try:
-                    field_doc = await fields_col.find_one(
-                        {"_id": ObjectId(field_id), "ownerId": user_id}
-                    )
-                except Exception:
-                    pass
-                
-                if not field_doc:
-                    try:
-                        field_doc = await fields_col.find_one(
-                            {"_id": field_id, "ownerId": user_id}
-                        )
-                    except Exception:
-                        pass
-
-                if field_doc:
-                    centroid_data = None
-                    poly = field_doc.get("polygon") or {}
-                    coords = poly.get("coordinates")
-                    if coords:
-                        from app.utils.geo import polygon_centroid
-                        centroid_data = polygon_centroid(coords)
-                    
-                    ctx.field = {
-                        "field_id": str(field_doc["_id"]),
-                        "name": field_doc.get("fieldName"),
-                        "soil_ph": field_doc.get("soil_ph", 6.5),
-                        "nitrogen_kg_ha": field_doc.get("nitrogen_kg_ha", 40),
-                        "area_ha": field_doc.get("areaHectare", 1.0),
-                        "centroid": centroid_data or {"latitude": 0.0, "longitude": 0.0}
-                    }
-                    ctx.data_sources["field_profile"] = True
-                    if centroid_data and centroid_data.get("latitude"):
-                        ctx.location = f"{centroid_data['latitude']},{centroid_data['longitude']}"
-                else:
-                    # Fallback to legacy field_profiles
-                    field_col = get_collection("field_profiles")
-                    field_doc = await field_col.find_one(
-                        {"field_id": field_id, "user_id": user_id}
-                    )
-                    if field_doc:
-                        field_doc.pop("_id", None)
-                        ctx.field = field_doc
-                        ctx.data_sources["field_profile"] = True
-                        
-                        centroid = field_doc.get("centroid") or {}
-                        if centroid.get("latitude"):
-                            ctx.location = f"{centroid['latitude']},{centroid['longitude']}"
-
-        except Exception as exc:
-            logger.error("ContextBuilder: digital twin load error: %s", exc)
-            ctx.data_sources["digital_twin"] = False
-
-
-    @staticmethod
-    async def _fetch_weather(ctx: StructuredContext) -> None:
-        """Fetch weather from Open-Meteo (with cache) based on context location."""
-        loc = ctx.location
-        if not loc and ctx.field:
-            # Derive location from field centroid if no explicit location
-            centroid = ctx.field.get("centroid")
-            if centroid:
-                loc = f"{centroid.get('latitude')},{centroid.get('longitude')}"
-
-        if not loc:
-            ctx.data_sources["weather"] = False
-            return
-
-        try:
-            from app.ai.weather.service import build_weather_advisory, fetch_weather
-
-            weather = await fetch_weather(loc, days=7)
-            if weather:
-                ctx.weather = weather
-                ctx.weather_advisory = build_weather_advisory(weather)
-                ctx.data_sources["weather"] = True
-            else:
-                ctx.data_sources["weather"] = False
-        except Exception as exc:
-            logger.error("ContextBuilder: weather fetch error: %s", exc)
-            ctx.data_sources["weather"] = False
-
-    @staticmethod
-    async def _fetch_satellite(ctx: StructuredContext) -> None:
-        """Fetch NDVI / crop health from GEE for the farm or field location."""
-        lat, lon, name = None, None, "unknown"
-        boundary = None
-
-        if ctx.farm:
-            centroid = ctx.farm.get("center_coordinate") or {}
-            lat = centroid.get("latitude")
-            lon = centroid.get("longitude")
-            name = ctx.farm.get("name") or "farm"
-            boundary = ctx.farm.get("boundary")
-        elif ctx.field:
-            centroid = ctx.field.get("centroid") or {}
-            lat = centroid.get("latitude")
-            lon = centroid.get("longitude")
-            name = ctx.field.get("name") or ctx.location or "field"
-            # If the field has a polygon boundary, we can pass it
-            if hasattr(ctx, 'field') and ctx.field:
-                # wait, let's see if field_doc has polygon. Yes, but in ctx.field we loaded name, soil_ph, nitrogen_kg_ha, area_ha, centroid.
-                pass
-        elif ctx.weather:
-            lat = ctx.weather.get("latitude")
-            lon = ctx.weather.get("longitude")
-            name = ctx.location or "location"
-
-        if lat is None or lon is None:
-            ctx.data_sources["satellite"] = False
-            return
-
-        try:
-            from app.ai.satellite.service import get_ndvi
-
-            sat = await get_ndvi(lat, lon, location_name=name, boundary=boundary)
-            if sat and sat.get("ndvi") is not None:
-                ctx.satellite = sat
-                ctx.data_sources["satellite"] = True
-            else:
-                ctx.data_sources["satellite"] = False
-        except Exception as exc:
-            logger.error("ContextBuilder: satellite fetch error: %s", exc)
-            ctx.data_sources["satellite"] = False
-
-    @staticmethod
-    async def _fetch_market_prices(ctx: StructuredContext) -> None:
-        """Fetch market/mandi prices for MARKET intent queries."""
-        if ctx.intent != IntentType.MARKET:
-            return
-
-        commodity = (
-            ctx.extra.get("crop")
-            or ctx.extra.get("commodity")
-            or (ctx.field.get("current_crop") if ctx.field else None)
-            or _extract_commodity(ctx.raw_message)
-        )
-        if not commodity:
-            ctx.data_sources["market"] = False
-            return
-
-        try:
-            from app.ai.market.service import fetch_market_prices
-
-            state = (
-                ctx.extra.get("state")
-                or (ctx.farmer.get("state") if ctx.farmer else None)
-                or ctx.location
-            )
-            prices = await fetch_market_prices(
-                commodity=commodity,
-                state=state,
-            )
-            ctx.extra["market_prices"] = prices
-            ctx.data_sources["market"] = bool(prices.get("prices"))
-        except Exception as exc:
-            logger.error("ContextBuilder: market price fetch error: %s", exc)
-            ctx.data_sources["market"] = False
-
-    @staticmethod
-    async def _load_chat_history(
-        ctx: StructuredContext,
-        user_id: Optional[str],
-    ) -> None:
-        """Load the last 5 chat exchanges for conversation continuity."""
-        if not user_id:
-            ctx.data_sources["chat_history"] = False
-            return
-
-        try:
-            from app.database import get_collection
-
-            col = get_collection("chat_history")
-            cursor = (
-                col.find({"user_id": user_id}, {"context_data": 0})
-                .sort("created_at", -1)
-                .limit(5)
-            )
-            history: List[Dict[str, Any]] = []
-            async for doc in cursor:
-                history.append({
-                    "role": "assistant",
-                    "user_said": doc.get("user_message"),
-                    "assistant_replied": doc.get("assistant_reply"),
-                    "intent": doc.get("intent"),
-                    "created_at": str(doc.get("created_at", "")),
-                })
-            ctx.recent_chat = list(reversed(history))  # chronological order
-            ctx.data_sources["chat_history"] = bool(history)
-        except Exception as exc:
-            logger.error("ContextBuilder: chat history load error: %s", exc)
-            ctx.data_sources["chat_history"] = False
-
-    @staticmethod
-    async def _run_ml(
-        ctx: StructuredContext,
-        intent: IntentType,
         params: Dict[str, Any],
     ) -> None:
-        """
-        Execute ML predictions in a thread pool (CPU-bound, non-blocking).
+        """Load the Digital Twin first (provides location for other providers)."""
+        from app.ai.providers import registry
 
-        Crop & vehicle predictions are intent-gated.
-        Yield, disease risk, and water stress run whenever enough data is present.
-        """
-        # ── Crop recommendation (explicit soil params required) ───────────────
-        if intent == IntentType.CROP and _has_soil_params(params):
-            try:
-                from app.ai.ml.models import predict_crop
-                result = await asyncio.to_thread(
-                    predict_crop,
-                    nitrogen=float(params.get("nitrogen", 40)),
-                    phosphorus=float(params.get("phosphorus", 40)),
-                    potassium=float(params.get("potassium", 40)),
-                    temperature=float(params.get("temperature", 25)),
-                    humidity=float(params.get("humidity", 60)),
-                    ph=float(params.get("ph", 6.5)),
-                    rainfall=float(params.get("rainfall", 80)),
-                )
-                ctx.crop_prediction = result
+        provider = registry.get("digital_twin")
+        if not provider or not params.get("user_id"):
+            ctx.data_sources["digital_twin"] = False
+            return
+
+        result = await provider.execute(params)
+
+        if result.available and result.data:
+            ctx.farmer = result.data.get("farmer")
+            ctx.farm = result.data.get("farm")
+            ctx.field = result.data.get("field")
+
+            ctx.data_sources["farmer_profile"] = ctx.farmer is not None
+            ctx.data_sources["farm_profile"] = ctx.farm is not None
+            ctx.data_sources["field_profile"] = ctx.field is not None
+
+            # Derive location from twin if not explicitly provided
+            derived = result.data.get("derived_location")
+            if derived and not ctx.location:
+                ctx.location = derived
+                params["location"] = derived
+                logger.debug("ContextBuilder: derived location from twin: %s", ctx.location)
+
+            # Propagate lat/lon for satellite provider
+            if ctx.farm:
+                center = ctx.farm.get("center_coordinate") or {}
+                if center.get("latitude"):
+                    params["latitude"] = center["latitude"]
+                    params["longitude"] = center["longitude"]
+                    params["location_name"] = ctx.farm.get("name", "farm")
+                    params["boundary"] = ctx.farm.get("boundary")
+            elif ctx.field:
+                centroid = ctx.field.get("centroid") or {}
+                if centroid.get("latitude"):
+                    params["latitude"] = centroid["latitude"]
+                    params["longitude"] = centroid["longitude"]
+                    params["location_name"] = ctx.field.get("name") or ctx.location or "field"
+
+            # Store provider metadata for refresh tracking
+            ctx.provider_metadata["digital_twin"] = {
+                "source": result.metadata.source,
+                "last_updated": result.metadata.last_updated,
+                "ttl_seconds": result.metadata.ttl_seconds,
+                "freshness": result.metadata.freshness.value,
+                "status": result.metadata.status,
+            }
+            ctx.provider_data["digital_twin"] = result.data
+        else:
+            ctx.data_sources["digital_twin"] = False
+            ctx.data_sources["farmer_profile"] = False
+            ctx.data_sources["farm_profile"] = False
+
+    # ── Phase 2: Concurrent providers ─────────────────────────────────────────
+
+    @staticmethod
+    async def _run_concurrent_providers(
+        ctx: StructuredContext,
+        params: Dict[str, Any],
+    ) -> None:
+        """Run Weather, Satellite, Market, and ChatHistory concurrently."""
+        from app.ai.providers import registry
+
+        tasks = []
+        provider_names = []
+
+        for provider in registry.all():
+            name = provider.name
+            if name in ("digital_twin", "ml_inference"):
+                continue
+
+            # Market (only for MARKET intent)
+            if name == "market":
+                if ctx.intent == IntentType.MARKET:
+                    commodity = (
+                        ctx.extra.get("crop")
+                        or ctx.extra.get("commodity")
+                        or (ctx.field.get("current_crop") if ctx.field else None)
+                        or _extract_commodity(ctx.raw_message)
+                    )
+                    if commodity:
+                        market_params = dict(params)
+                        market_params["commodity"] = commodity
+                        market_params["state"] = (
+                            ctx.extra.get("state")
+                            or (ctx.farmer.get("state") if ctx.farmer else None)
+                            or ctx.location
+                        )
+                        tasks.append(provider.execute(market_params))
+                        provider_names.append(name)
+            
+            # Satellite (needs lat/lon)
+            elif name == "satellite":
+                if params.get("latitude") is not None:
+                    tasks.append(provider.execute(params))
+                    provider_names.append(name)
+
+            # Chat history (needs user_id)
+            elif name == "chat_history":
+                if params.get("user_id"):
+                    tasks.append(provider.execute(params))
+                    provider_names.append(name)
+                    
+            # All other dynamic providers (weather, geesoil, etc.)
+            else:
+                tasks.append(provider.execute(params))
+                provider_names.append(name)
+
+        if not tasks:
+            return
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for name, result in zip(provider_names, results):
+            if isinstance(result, Exception):
+                logger.error("Provider '%s' raised: %s", name, result)
+                ctx.data_sources[name] = False
+                continue
+
+            if result.available and result.data:
+                ctx.data_sources[name] = True
+                ctx.provider_metadata[name] = {
+                    "source": result.metadata.source,
+                    "last_updated": result.metadata.last_updated,
+                    "ttl_seconds": result.metadata.ttl_seconds,
+                    "freshness": result.metadata.freshness.value,
+                    "status": result.metadata.status,
+                }
+                ctx.provider_data[name] = result.data
+
+                # Map provider data back to StructuredContext explicit fields for backward compatibility
+                if name == "weather":
+                    ctx.weather = result.data.get("weather")
+                    ctx.weather_advisory = result.data.get("weather_advisory")
+                elif name == "satellite":
+                    ctx.satellite = result.data
+                elif name == "market":
+                    ctx.extra["market_prices"] = result.data
+                elif name == "chat_history":
+                    ctx.recent_chat = result.data.get("recent_chat", [])
+            else:
+                ctx.data_sources[name] = False
+
+    # ── Phase 3: ML Inference ─────────────────────────────────────────────────
+
+    @staticmethod
+    async def _run_ml_provider(
+        ctx: StructuredContext,
+        params: Dict[str, Any],
+    ) -> None:
+        """Run ML models with intent-gated execution."""
+        from app.ai.providers import registry
+
+        ml_prov = registry.get("ml_inference")
+        if not ml_prov:
+            return
+
+        # Pass assembled context data to ML provider
+        ml_params = dict(params)
+        ml_params["weather"] = ctx.weather
+        ml_params["satellite"] = ctx.satellite
+        ml_params["field"] = ctx.field
+        ml_params["farm"] = ctx.farm
+
+        result = await ml_prov.execute(ml_params)
+
+        if result.available and result.data:
+            # Map ML outputs to StructuredContext (identical field names)
+            if "crop_prediction" in result.data:
+                ctx.crop_prediction = result.data["crop_prediction"]
                 ctx.data_sources["ml_crop"] = True
-            except Exception as exc:
-                logger.error("ContextBuilder: crop ML error: %s", exc)
-                ctx.data_sources["ml_crop"] = False
-
-        # ── Vehicle demand (explicit params required) ─────────────────────────
-        elif intent == IntentType.VEHICLE and _has_vehicle_params(params):
-            try:
-                from app.ai.ml.models import predict_vehicle_demand
-                result = await asyncio.to_thread(
-                    predict_vehicle_demand,
-                    quantity_tonnes=float(params.get("quantity_tonnes", 1)),
-                    destination=str(params.get("destination", "")),
-                    crop_type=str(params.get("crop_type", "")),
-                    date=str(params.get("date", datetime.now(UTC).date().isoformat())),
-                )
-                ctx.vehicle_prediction = result
+            if "vehicle_prediction" in result.data:
+                ctx.vehicle_prediction = result.data["vehicle_prediction"]
                 ctx.data_sources["ml_vehicle"] = True
-            except Exception as exc:
-                logger.error("ContextBuilder: vehicle ML error: %s", exc)
-                ctx.data_sources["ml_vehicle"] = False
-
-        # ── Advanced field/farm intelligence (run when field/farm + weather + satellite available)
-        target = ctx.field or ctx.farm
-        if target and ctx.weather and ctx.satellite and ctx.satellite.get("ndvi") is not None:
-            ndvi = float(ctx.satellite.get("ndvi", 0.4))
-            weather_cur = ctx.weather.get("current", {})
-            weather_fc = ctx.weather.get("forecast", [{}])
-            temp = float(weather_cur.get("temperature_c") or 25)
-            humidity = float(weather_cur.get("humidity_pct") or 60)
-            rainfall_7d = sum(
-                float(d.get("rainfall_mm") or 0)
-                for d in weather_fc[:7]
-            )
-
-            # Yield prediction
-            try:
-                from app.ai.ml.models import predict_yield
-                area_ha = float(target.get("area_ha") or target.get("area_hectares") or 1.0)
-                yield_result = await asyncio.to_thread(
-                    predict_yield,
-                    ndvi=ndvi,
-                    rainfall_mm=rainfall_7d,
-                    temperature_c=temp,
-                    soil_ph=float(target.get("soil_ph") or 6.5),
-                    nitrogen_kg_ha=float(target.get("nitrogen_kg_ha") or 40),
-                    humidity_pct=humidity,
-                    area_ha=area_ha,
-                )
-                ctx.extra["yield_prediction"] = yield_result
+            if "yield_prediction" in result.data:
+                ctx.extra["yield_prediction"] = result.data["yield_prediction"]
                 ctx.data_sources["ml_yield"] = True
-            except Exception as exc:
-                logger.error("ContextBuilder: yield ML error: %s", exc)
-                ctx.data_sources["ml_yield"] = False
-
-            # Disease risk prediction
-            try:
-                from app.ai.ml.models import predict_disease_risk
-                disease_result = await asyncio.to_thread(
-                    predict_disease_risk,
-                    humidity_pct=humidity,
-                    temperature_c=temp,
-                    rainfall_mm=float(weather_cur.get("rainfall_mm") or 0),
-                    ndvi=ndvi,
-                )
-                ctx.extra["disease_risk"] = disease_result
+            if "disease_risk" in result.data:
+                ctx.extra["disease_risk"] = result.data["disease_risk"]
                 ctx.data_sources["ml_disease"] = True
-            except Exception as exc:
-                logger.error("ContextBuilder: disease ML error: %s", exc)
-                ctx.data_sources["ml_disease"] = False
-
-            # Water stress (deterministic rule-based)
-            try:
-                from app.ai.ml.models import predict_water_stress
-                water_result = predict_water_stress(
-                    ndvi=ndvi,
-                    rainfall_mm_7d=rainfall_7d,
-                    temperature_c=temp,
-                    humidity_pct=humidity,
-                    soil_type=str(target.get("soil_type") or "loamy"),
-                )
-                ctx.extra["water_stress"] = water_result
+            if "water_stress" in result.data:
+                ctx.extra["water_stress"] = result.data["water_stress"]
                 ctx.data_sources["ml_water"] = True
-            except Exception as exc:
-                logger.error("ContextBuilder: water stress error: %s", exc)
-                ctx.data_sources["ml_water"] = False
+
+            ctx.provider_metadata["ml_inference"] = {
+                "source": result.metadata.source,
+                "last_updated": result.metadata.last_updated,
+                "ttl_seconds": result.metadata.ttl_seconds,
+                "freshness": result.metadata.freshness.value,
+                "status": result.metadata.status,
+            }
+            ctx.provider_data["ml_inference"] = result.data
 
 
 # ── Parameter presence helpers ────────────────────────────────────────────────
@@ -573,4 +451,3 @@ def _extract_commodity(message: str) -> Optional[str]:
         if crop in msg_lower:
             return crop
     return None
-

@@ -99,6 +99,8 @@ COLLECTIONS = {
     "market_prices": "market_prices",
     # ── Field Mapping ─────────────────────────────────────────────────────────
     "fields": "fields",
+    # ── Refresh Snapshots (Provider Architecture v2) ──────────────────────────
+    "refresh_snapshots": "refresh_snapshots",
 }
 
 

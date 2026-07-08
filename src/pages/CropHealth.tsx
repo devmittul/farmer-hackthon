@@ -192,7 +192,7 @@ export default function CropHealth() {
                     <span>Index Rating</span>
                     <span>{satellite.vegetation_index}%</span>
                   </div>
-                  <Progress value={insights?.percentage} className={`h-3 rounded-full bg-slate-100 ${insights?.progressBar}`} />
+                  <Progress value={Math.min(Math.max(satellite.vegetation_index || 0, 0), 100)} className={`h-3 rounded-full bg-slate-100 ${insights?.progressBar}`} />
                 </div>
               </CardContent>
             </Card>

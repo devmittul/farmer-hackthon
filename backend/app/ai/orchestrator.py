@@ -25,7 +25,9 @@ Backward compatibility:
 """
 from __future__ import annotations
 
+import time
 import logging
+import traceback
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Dict, Optional
@@ -88,6 +90,7 @@ async def orchestrate(
     logger.info("[%s] Intent: %s", request_id[:8], intent.value)
 
     # ── 3. Context Building ───────────────────────────────────────────────────
+    context_start = time.perf_counter()
     try:
         ctx = await ContextBuilder.build(
             request_id=request_id,
@@ -101,8 +104,16 @@ async def orchestrate(
             extra_params=extra_params or {},
         )
     except Exception as exc:
-        logger.error("[%s] Context build failed: %s", request_id[:8], exc)
+        exc_type = type(exc).__name__
+        tb_str = "".join(traceback.format_exception(exc_type, exc, exc.__traceback__))
+        logger.error(
+            "[%s] Stage: Context Building | Error Type: %s | Original Exception: %s\nStack Trace:\n%s",
+            request_id[:8], exc_type, str(exc), tb_str
+        )
         ctx = None
+    
+    context_latency_ms = (time.perf_counter() - context_start) * 1000
+    logger.info("[%s] Context building completed in %.2fms", request_id[:8], context_latency_ms)
 
     # ── 4. Confidence Scoring ─────────────────────────────────────────────────
     confidence: Optional[Dict[str, Any]] = None
@@ -110,26 +121,56 @@ async def orchestrate(
         try:
             confidence = ConfidenceEngine.compute(ctx)
         except Exception as exc:
-            logger.warning("[%s] Confidence compute failed: %s", request_id[:8], exc)
+            exc_type = type(exc).__name__
+            tb_str = "".join(traceback.format_exception(exc_type, exc, exc.__traceback__))
+            logger.warning(
+                "[%s] Stage: Confidence Scoring | Error Type: %s | Original Exception: %s\nStack Trace:\n%s",
+                request_id[:8], exc_type, str(exc), tb_str
+            )
 
     # ── 5. Prompt Assembly ────────────────────────────────────────────────────
+    prompt_start = time.perf_counter()
     try:
         prompt = _build_prompt(intent, message, language, ctx)
     except Exception as exc:
-        logger.error("[%s] Prompt build failed: %s", request_id[:8], exc)
+        exc_type = type(exc).__name__
+        tb_str = "".join(traceback.format_exception(exc_type, exc, exc.__traceback__))
+        logger.error(
+            "[%s] Stage: Prompt Assembly | Error Type: %s | Original Exception: %s\nStack Trace:\n%s",
+            request_id[:8], exc_type, str(exc), tb_str
+        )
         # Fallback: send raw message with language instruction only
         from app.ai import prompt_builder
         prompt = prompt_builder.build_chat_prompt(message, language)
+    
+    prompt_latency_ms = (time.perf_counter() - prompt_start) * 1000
+    logger.info("[%s] Prompt assembly completed in %.2fms", request_id[:8], prompt_latency_ms)
 
     # ── 6. Reasoning Engine ───────────────────────────────────────────────────
     try:
         reply, ai_latency_ms = await ReasoningEngine.generate(prompt)
     except Exception as exc:
-        logger.error("[%s] Reasoning engine failed: %s", request_id[:8], exc)
-        reply = (
-            "I'm having trouble connecting to the AI engine right now. "
-            "Please try again in a moment."
+        exc_type = type(exc).__name__
+        tb_str = "".join(traceback.format_exception(exc_type, exc, exc.__traceback__))
+        logger.error(
+            "[%s] Stage: Reasoning Engine | Error Type: %s | Original Exception: %s\nStack Trace:\n%s",
+            request_id[:8], exc_type, str(exc), tb_str
         )
+        
+        err_str = str(exc).lower()
+        if "429" in err_str or "quota" in err_str or "rate limit" in err_str or "exhausted" in err_str:
+            reply = "⏳ AI rate limit exceeded or quota exhausted. Please wait a moment."
+        elif "401" in err_str or "403" in err_str or "api key" in err_str or "auth" in err_str or "invalid" in err_str:
+            reply = "🔑 AI configuration error: Invalid API credentials."
+        elif "timeout" in err_str:
+            reply = "⏳ Request timeout: The AI engine took too long to respond."
+        elif "connection" in err_str or "network" in err_str:
+            reply = "🌐 Network error: Unable to reach the AI engine."
+        elif "satellite" in err_str or "gee" in err_str:
+            reply = "🛰 Satellite service unavailable."
+        else:
+            reply = "⚠ Internal server error while connecting to the AI engine."
+        
         ai_latency_ms = 0.0
 
     # ── 7. Collect structured data for response ───────────────────────────────
@@ -158,7 +199,8 @@ async def orchestrate(
     )
 
     # ── 9. Format & Return ────────────────────────────────────────────────────
-    return ResponseFormatter.format(
+    format_start = time.perf_counter()
+    response = ResponseFormatter.format(
         request_id=request_id,
         intent=intent,
         language=language,
@@ -169,6 +211,10 @@ async def orchestrate(
         latency_ms=ai_latency_ms,
         total_latency_ms=elapsed_total_ms,
     )
+    format_latency_ms = (time.perf_counter() - format_start) * 1000
+    logger.info("[%s] Response Formatting completed in %.2fms", request_id[:8], format_latency_ms)
+    
+    return response
 
 
 # ── Prompt dispatch ───────────────────────────────────────────────────────────
@@ -341,6 +387,7 @@ async def _persist_chat(
     latency_ms: float,
 ) -> None:
     """Persist the chat exchange to MongoDB asynchronously (non-fatal)."""
+    db_start = time.perf_counter()
     try:
         from app.database import get_collection
 
@@ -356,6 +403,8 @@ async def _persist_chat(
             "latency_ms": latency_ms,
             "created_at": datetime.now(UTC),
         })
+        db_latency_ms = (time.perf_counter() - db_start) * 1000
+        logger.info("Database Query (persist chat) completed in %.2fms", db_latency_ms)
     except Exception as exc:
         logger.error("Failed to persist chat history: %s", exc)
 

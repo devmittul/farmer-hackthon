@@ -5,6 +5,7 @@ POST /chat  – Main AI chat endpoint via orchestrator
 GET  /history – Retrieve chat history for authenticated user
 """
 import logging
+import time
 
 from fastapi import APIRouter, HTTPException, Query, status
 
@@ -42,6 +43,7 @@ async def chat(
     Authentication is optional – anonymous users get full AI access.
     """
     user_id = current_user["_id"] if current_user else None
+    req_start = time.perf_counter()
 
     try:
         result = await orchestrate(
@@ -53,6 +55,8 @@ async def chat(
             field_id=payload.field_id,        # ← Digital Twin field context
             farm_id=payload.farm_id,           # ← Active farm context (geo)
         )
+        flask_latency_ms = (time.perf_counter() - req_start) * 1000
+        logger.info("FastAPI Processing /chat completed in %.2fms", flask_latency_ms)
         return result
     except Exception as exc:
         logger.exception("Chat orchestration error")

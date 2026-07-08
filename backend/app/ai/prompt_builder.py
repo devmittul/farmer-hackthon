@@ -16,12 +16,100 @@ from app.utils.language import LANGUAGE_NAMES
 _SYSTEM_BASE = """You are KrishiMitra AI, an intelligent agricultural and rural mobility assistant.
 You help Indian farmers with crop advice, weather insights, transport logistics, and emergency guidance.
 You are empathetic, practical, and always grounded in the factual data provided to you.
+
 CRITICAL RULES:
 - NEVER invent facts. Only use the structured data provided in this prompt.
 - Always reply in the user's language: {language_name}.
 - Keep responses concise and actionable.
 - Format replies clearly with bullet points or numbered lists when appropriate.
-- If data is unavailable, honestly say so and guide the user."""
+- If data is unavailable, honestly say so and guide the user.
+
+==========================================================
+REASONING RULES
+==========================================================
+- Every recommendation must explain WHY it was generated using the real context already available in the data provided.
+- Reference the actual data used (e.g. weather, soil, NDVI, satellite, market).
+- Never produce generic advice when supporting data exists.
+
+==========================================================
+STANDARD RESPONSE FORMAT
+==========================================================
+Every single AI response MUST strictly follow the layout below. 
+Do NOT dump raw JSON. Use markdown, icons, headings, and bullet points. 
+Omit any section under "Analysis Based On" if that specific data is not available in your prompt context.
+Do NOT fabricate any value. If confidence cannot be reliably determined, display Medium. Do NOT invent percentages.
+Determine field status only from available data.
+
+[Field Status Emoji (🟢/🟡/🔴)] Field Status: [Healthy | Needs Attention | High Risk]
+
+────────────────────────────
+
+🌾 Recommendation
+
+[Main recommendation]
+
+────────────────────────────
+
+🧠 Why This Recommendation?
+
+[Provide 3–6 concise bullet points referencing ONLY actual data available in the prompt]
+
+────────────────────────────
+
+✅ Suggested Action
+
+[Provide clear actionable steps]
+
+────────────────────────────
+
+⚠ Things to Monitor
+
+[Mention important observations and risks supported by data]
+
+────────────────────────────
+
+📊 Analysis Based On
+
+--------------------------------------------------
+[Display ONLY the sections below if data exists. Omit the entire section and separator if empty.]
+
+🛰 Satellite
+[e.g. NDVI, EVI, Crop Health, Last Updated]
+
+--------------------------------------------------
+
+🌦 Weather
+[e.g. Temperature, Humidity, Rain Forecast, Last Updated]
+
+--------------------------------------------------
+
+🌱 Soil
+[e.g. Soil Type, pH, Water Holding Capacity, Source, Last Updated]
+
+--------------------------------------------------
+
+💹 Market
+[e.g. Recommended Market, Current Price, Trend]
+
+--------------------------------------------------
+
+📍 Farm
+[e.g. Field Area, Crop, Growth Stage]
+
+--------------------------------------------------
+
+🎯 Confidence
+[High | Medium | Low]
+
+--------------------------------------------------
+
+📡 Data Sources Used
+[List all providers that successfully contributed data. Do NOT hardcode provider names. Derive this dynamically from the Provider/Source or Data Source information provided in the prompt context. If a provider is unavailable or not listed, do not display it.]
+✅ [Provider Name]
+Status: Available
+Last Updated: [Freshness]
+
+"""
 
 
 def _system_prompt(language: LanguageCode) -> str:
@@ -50,7 +138,7 @@ Provide a helpful, factual response. If the question is agricultural or mobility
 draw on established agronomic knowledge. Do not speculate beyond what is known.
 
 ## Expected Output
-A clear, concise response in {LANGUAGE_NAMES.get(language, 'English')}.
+Your entire response MUST strictly follow the STANDARD RESPONSE FORMAT described in the system instructions. Write in {LANGUAGE_NAMES.get(language, 'English')}.
 """
 
 
@@ -91,7 +179,7 @@ Current: {current.get('temperature_c', 'N/A')}°C, {current.get('condition', 'N/
 4. Do NOT add weather facts not present above.
 
 ## Expected Output
-A structured weather summary and farming advisory in {LANGUAGE_NAMES.get(language, 'English')}.
+Your entire response MUST strictly follow the STANDARD RESPONSE FORMAT described in the system instructions. Write in {LANGUAGE_NAMES.get(language, 'English')}.
 """
 
 
@@ -126,7 +214,7 @@ Alternative crops: {alternatives_str}
 5. Do NOT suggest crops not in the prediction above.
 
 ## Expected Output
-A detailed crop recommendation explanation in {LANGUAGE_NAMES.get(language, 'English')} with practical tips.
+Your entire response MUST strictly follow the STANDARD RESPONSE FORMAT described in the system instructions. Write in {LANGUAGE_NAMES.get(language, 'English')}.
 """
 
 
@@ -170,7 +258,7 @@ Estimated Time: {route_data.get('total_duration_min')} minutes
 5. Do NOT add roads or distances not in the verified data above.
 
 ## Expected Output
-A practical transport advisory in {LANGUAGE_NAMES.get(language, 'English')}.
+Your entire response MUST strictly follow the STANDARD RESPONSE FORMAT described in the system instructions. Write in {LANGUAGE_NAMES.get(language, 'English')}.
 """
 
 
@@ -206,7 +294,7 @@ Best Time Window: {prediction.get('best_time_window', 'N/A')}
 4. Advise on booking logistics.
 
 ## Expected Output
-Practical vehicle booking guidance in {LANGUAGE_NAMES.get(language, 'English')}.
+Your entire response MUST strictly follow the STANDARD RESPONSE FORMAT described in the system instructions. Write in {LANGUAGE_NAMES.get(language, 'English')}.
 """
 
 
@@ -232,7 +320,7 @@ Description: {description}
 4. Stay calm and reassuring in tone.
 
 ## Expected Output
-Emergency guidance in {LANGUAGE_NAMES.get(language, 'English')}. Be concise and actionable.
+Your entire response MUST strictly follow the STANDARD RESPONSE FORMAT described in the system instructions. Write in {LANGUAGE_NAMES.get(language, 'English')}.
 """
 
 
@@ -286,7 +374,7 @@ Advice: {prices_data.get("advice", "")}
 6. Keep the response concise and supportive.
 
 ## Expected Output
-Market insight guidance in {lang_name}.
+Your entire response MUST strictly follow the STANDARD RESPONSE FORMAT described in the system instructions. Write in {lang_name}.
 """
 
 
@@ -297,181 +385,111 @@ def _dict_to_block(d: dict[str, Any]) -> str:
 
 
 # ── Intent: FIELD INTELLIGENCE (Digital Twin) ─────────────────────────────────
-def build_field_intelligence_prompt(
-    user_message: str,
-    language: LanguageCode,
-    farmer: Optional[dict[str, Any]],
-    field: Optional[dict[str, Any]],
-    weather: Optional[dict[str, Any]],
-    satellite: Optional[dict[str, Any]],
-    yield_prediction: Optional[dict[str, Any]] = None,
-    disease_risk: Optional[dict[str, Any]] = None,
-    water_stress: Optional[dict[str, Any]] = None,
-    recent_chat: Optional[list] = None,
-    farm: Optional[dict[str, Any]] = None,
-) -> str:
-    """
-    Full Digital Twin context prompt.
-
-    Injects farmer identity, farm & field profile, weather, satellite NDVI,
-    yield prediction, disease risk, and water stress into a single
-    structured prompt for comprehensive field-specific responses.
-    """
-    lang_name = LANGUAGE_NAMES.get(language, "English")
-
-    # ── Farmer block ──────────────────────────────────────────────────────────
-    farmer_block = ""
-    if farmer:
-        farmer_block = f"""
-## Farmer Profile
-Name: {farmer.get("name", "Unknown")}
-Language: {farmer.get("preferred_language", "en")}
-District: {farmer.get("district", "Unknown")}
-State: {farmer.get("state", "Unknown")}
-Primary Crops: {", ".join(farmer.get("primary_crops", [])) or "Not specified"}
-"""
-
-    # ── Farm block ────────────────────────────────────────────────────────────
-    farm_block = ""
-    if farm:
-        location_parts = [
-            f"Village {farm.get('village')}" if farm.get("village") else "",
-            f"District {farm.get('district')}" if farm.get("district") else "",
-            farm.get("state") or "",
-            farm.get("country") or "",
-        ]
-        location_str = ", ".join([p for p in location_parts if p]) or "Unknown"
-        farm_block = f"""
-## Farm Profile
-Farm Name: {farm.get("name", "Unknown")} | Area: {farm.get("area_acres", "?")} acres
-Location: {location_str}
-"""
-
-    # ── Field block ───────────────────────────────────────────────────────────
-    field_block = ""
-    if field:
-        field_block = f"""
-## Field Profile
-Field: {field.get("name", "Unknown")} | Area: {field.get("area_ha", "?")} ha
-Soil Type: {field.get("soil_type", "Unknown")} | pH: {field.get("soil_ph", "?")}
-Nutrients: N={field.get("nitrogen_kg_ha", "?")} P={field.get("phosphorus_kg_ha", "?")} K={field.get("potassium_kg_ha", "?")} kg/ha
-Irrigation: {field.get("irrigation_type", "Unknown")} | Water source: {field.get("water_source", "Unknown")}
-Current Crop: {field.get("current_crop", "Unknown")} ({field.get("current_variety", "")})
-Sowing Date: {field.get("sowing_date", "Unknown")} | Expected Harvest: {field.get("expected_harvest_date", "Unknown")}
-Growth Stage: {field.get("growth_stage", "Unknown")}
-"""
-
-    # ── Weather block ─────────────────────────────────────────────────────────
-    weather_block = ""
-    if weather:
-        cur = weather.get("current", {})
-        forecast_lines = "\n".join(
-            f"  • {d['date']}: {d.get('condition','?')}, "
-            f"{d.get('temp_min_c','?')}–{d.get('temp_max_c','?')}°C, "
-            f"Rain: {d.get('rainfall_mm', 0)}mm"
-            for d in weather.get("forecast", [])[:3]
-        )
-        weather_block = f"""
-## Live Weather (Verified – Open-Meteo)
-Current: {cur.get("temperature_c", "?")}°C, {cur.get("condition", "?")}, Humidity: {cur.get("humidity_pct", "?")}%
-3-Day Forecast:
-{forecast_lines}
-"""
-
-    # ── Satellite block ───────────────────────────────────────────────────────
-    satellite_block = ""
-    if satellite and satellite.get("ndvi") is not None:
-        satellite_block = f"""
-## Satellite Data (Verified – Sentinel-2/GEE)
-NDVI: {satellite.get("ndvi", "?")} | Crop Health: {satellite.get("crop_health", "?")}
-Vegetation Index: {satellite.get("vegetation_index", "?")}%
-Harvest Stage: {satellite.get("harvest_detection", "?")}
-Analysis Date: {satellite.get("analysis_date", "?")}
-"""
-
-    # ── ML Intelligence block ─────────────────────────────────────────────────
-    intelligence_block = ""
-    if yield_prediction:
-        intelligence_block += f"""
-## ML Yield Prediction (Verified)
-Expected Yield: {yield_prediction.get("yield_kg_per_ha", "?")} kg/ha
-Total Field Yield: {yield_prediction.get("total_yield_kg", "?")} kg
-Category: {yield_prediction.get("category", "?").upper()} | Confidence: {yield_prediction.get("confidence", "?")}%
-"""
-
-    if disease_risk:
-        intelligence_block += f"""
-## ML Disease Risk Assessment (Verified)
-Risk Level: {disease_risk.get("risk_level", "?")} | Risk Score: {disease_risk.get("risk_score", "?")}%
-Common Diseases: {", ".join(disease_risk.get("common_diseases", [])) or "None detected"}
-Recommended Actions: {" | ".join(disease_risk.get("preventive_actions", [])[:2])}
-"""
-
-    if water_stress:
-        intelligence_block += f"""
-## Water Stress Assessment (Verified)
-Stress Level: {water_stress.get("stress_level", "?").upper()} | Irrigate Now: {water_stress.get("irrigate_now", False)}
-Water Need: {water_stress.get("water_need_mm", 0)}mm | ET Estimate (7d): {water_stress.get("et_estimate_mm", "?")}mm
-Recommendation: {water_stress.get("recommendation", "")}
-"""
-
-    # ── Conversation history ──────────────────────────────────────────────────
-    history_block = ""
-    if recent_chat:
-        history_lines = "\n".join(
-            f"  Farmer: {m.get('user_said', '')}\n  Assistant: {m.get('assistant_replied', '')}"
-            for m in recent_chat[-3:]
-        )
-        history_block = f"\n## Recent Conversation\n{history_lines}\n"
-
-    return f"""{_system_prompt(language)}
-{farmer_block}{farm_block}{field_block}{weather_block}{satellite_block}{intelligence_block}{history_block}
-## Farmer's Question
-{user_message}
-
-## Instructions
-1. Address the farmer by name if known.
-2. Base your answer STRICTLY on the verified data above – never invent values.
-3. If yield is below_average or poor, explain why based on the data.
-4. If disease risk is MODERATE or above, emphasise the preventive actions.
-5. If water stress requires immediate irrigation, make this the first recommendation.
-6. Reference the specific field/farm name and crop where relevant.
-7. Keep the response actionable and practical for a smallholder farmer.
-
-## Expected Output
-A personalised, field/farm-specific advisory in {lang_name}. Be concise. Use bullet points.
-"""
+# ── Intent: FIELD INTELLIGENCE (Digital Twin) ─────────────────────────────────
+def _format_value(val: Any, indent: int = 0) -> str:
+    """Format any nested dictionary or list cleanly."""
+    spaces = " " * indent
+    if isinstance(val, dict):
+        lines = []
+        for k, v in val.items():
+            if isinstance(v, (dict, list)):
+                lines.append(f"{spaces}{k.replace('_', ' ').title()}:")
+                lines.append(_format_value(v, indent + 2))
+            else:
+                lines.append(f"{spaces}{k.replace('_', ' ').title()}: {v}")
+        return "\n".join(lines)
+    elif isinstance(val, list):
+        if not val:
+            return f"{spaces}None"
+        if isinstance(val[0], (dict, list)):
+            return "\n".join(f"{spaces}- \n" + _format_value(item, indent + 2) for item in val)
+        else:
+            return spaces + ", ".join(str(item) for item in val)
+    else:
+        return f"{spaces}{val}"
 
 
-# ── Digital Twin context builder helper ───────────────────────────────────────
 def build_digital_twin_prompt_from_context(
     user_message: str,
     language: LanguageCode,
     ctx: Any,
 ) -> str:
     """
-    Convenience wrapper: build the full Digital Twin prompt directly
-    from a StructuredContext object.
-
-    Args:
-        user_message: Raw user input.
-        language:     Detected language.
-        ctx:          StructuredContext produced by ContextBuilder.
-
-    Returns:
-        Fully assembled prompt string.
+    Full Digital Twin context prompt.
+    Automatically iterates through every available StructuredContext section.
     """
-    return build_field_intelligence_prompt(
-        user_message=user_message,
-        language=language,
-        farmer=getattr(ctx, "farmer", None),
-        field=getattr(ctx, "field", None),
-        weather=getattr(ctx, "weather", None),
-        satellite=getattr(ctx, "satellite", None),
-        yield_prediction=ctx.extra.get("yield_prediction") if hasattr(ctx, "extra") else None,
-        disease_risk=ctx.extra.get("disease_risk") if hasattr(ctx, "extra") else None,
-        water_stress=ctx.extra.get("water_stress") if hasattr(ctx, "extra") else None,
-        recent_chat=getattr(ctx, "recent_chat", None),
-        farm=getattr(ctx, "farm", None),
-    )
+    lang_name = LANGUAGE_NAMES.get(language, "English")
+    blocks = []
+    
+    # Iterate through all available provider data
+    provider_data_dict = getattr(ctx, "provider_data", {})
+    provider_metadata_dict = getattr(ctx, "provider_metadata", {})
+    
+    for provider_name, data in provider_data_dict.items():
+        if not data:
+            continue
+            
+        metadata = provider_metadata_dict.get(provider_name, {})
+        title = provider_name.replace("_", " ").title()
+        
+        # Determine source
+        source = "Unknown"
+        if isinstance(metadata, dict):
+            source = metadata.get("source", "Unknown")
+        elif hasattr(metadata, "source"):
+            source = getattr(metadata, "source")
+            
+        # Determine freshness
+        freshness = "Unknown"
+        if isinstance(metadata, dict):
+            freshness = metadata.get("freshness", "Unknown")
+        elif hasattr(metadata, "freshness"):
+            freshness = getattr(metadata, "freshness")
+        
+        # Look for confidence
+        confidence_str = ""
+        if isinstance(data, dict):
+            conf = data.get("confidence")
+            if conf is None:
+                for v in data.values():
+                    if isinstance(v, dict) and "confidence" in v:
+                        conf = v["confidence"]
+                        break
+            if conf is not None:
+                confidence_str = f" | Confidence: {conf}%"
+                
+        # Handle chat history specially for cleaner output
+        if provider_name == "chat_history" and isinstance(data, dict) and "recent_chat" in data:
+            content_str = "\n".join(
+                f"  Farmer: {m.get('user_said', '')}\n  Assistant: {m.get('assistant_replied', '')}"
+                for m in data["recent_chat"][-3:]
+            )
+            if not content_str:
+                continue
+        else:
+            content_str = _format_value(data)
+            
+        block = f"## {title}\nProvider/Source: {source}\nFreshness: {str(freshness).upper()}{confidence_str}\n\n{content_str}\n"
+        blocks.append(block)
+
+    all_blocks = "\n".join(blocks)
+
+    return f"""{_system_prompt(language)}
+{all_blocks}
+## Farmer's Question
+{user_message}
+
+## Instructions
+1. Address the farmer by name if known from the Digital Twin data.
+2. Base your answer STRICTLY on the verified data above – never invent values.
+3. If yield is below average or poor, explain why based on the data.
+4. If disease risk is MODERATE or above, emphasise the preventive actions.
+5. If water stress requires immediate irrigation, make this the first recommendation.
+6. Reference the specific field/farm name and crop where relevant.
+7. Keep the response actionable and practical for a smallholder farmer.
+8. Make sure EVERY recommendation explains WHY it was generated using the available data (e.g., NDVI, Weather, Soil).
+
+## Expected Output
+Your entire response MUST strictly follow the STANDARD RESPONSE FORMAT described in the system instructions. Write in {lang_name}.
+"""
 
